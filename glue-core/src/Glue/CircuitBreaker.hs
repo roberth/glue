@@ -97,33 +97,33 @@ circuitBreaker' :: (MonadBaseControl IO n)
                => CircuitBreakerOptions       -- ^ Options for specifying the circuit breaker behaviour.
                -> n (CircuitBreakerState, Middleware)
 circuitBreaker' options = do
- ref <- newIORef $ BreakerClosed 0
- return (CircuitBreakerState [ref], Middleware $ \service -> let
+  ref <- newIORef $ BreakerClosed 0
+  return (CircuitBreakerState [ref], Middleware $ \service -> let
       getCurrentTime              = liftBase $ round `fmap` getPOSIXTime
       failureMax                  = maxBreakerFailures options
-      callIfClosed request ref    = bracketOnError (return ()) (\_ -> incErrors ref) (\_ -> service request)
-      canaryCall request ref      = do
-                                      result <- callIfClosed request ref
+      callIfClosed request        = bracketOnError (return ()) (\_ -> incErrors) (\_ -> service request)
+      canaryCall request          = do
+                                      result <- callIfClosed request
                                       writeIORef ref $ BreakerClosed 0
                                       return result
-      incErrors ref               = do
+      incErrors                   = do
                                       currentTime <- getCurrentTime
                                       atomicModifyIORef' ref $ \status -> case status of
                                         (BreakerClosed errorCount) -> (if errorCount >= failureMax then BreakerOpen (currentTime + (resetTimeoutSecs options)) else BreakerClosed (errorCount + 1), ())
                                         other                             -> (other, ())
                                       
       failingCall                 = throw $ CircuitBreakerException $ breakerDescription options
-      callIfOpen request ref      = do
+      callIfOpen request          = do
                                       currentTime <- getCurrentTime
                                       canaryRequest <- atomicModifyIORef' ref $ \status -> case status of 
                                                               (BreakerClosed _)  -> (status, False)
                                                               (BreakerOpen time) -> if currentTime > time then ((BreakerOpen (currentTime + (resetTimeoutSecs options))), True) else (status, False)
                                       
-                                      if canaryRequest then canaryCall request ref else failingCall
-      breakerService ref request  = do
+                                      if canaryRequest then canaryCall request else failingCall
+      breakerService request      = do
                                       status <- readIORef ref
                                       case status of 
-                                        (BreakerClosed _)  -> callIfClosed request ref
-                                        (BreakerOpen _)    -> callIfOpen request ref
-      in breakerService ref
+                                        (BreakerClosed _)  -> callIfClosed request
+                                        (BreakerOpen _)    -> callIfOpen request
+      in breakerService
         )
