@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE Rank2Types #-}
 
 -- | Module containing circuit breaker functionality, which is the ability to open a circuit once a number of failures have occurred, thereby preventing later calls from attempting to make unsuccessful calls.
 -- | Often this is useful if the underlying service were to repeatedly time out, so as to reduce the number of calls inflight holding up upstream callers.
@@ -13,9 +14,12 @@ module Glue.CircuitBreaker(
   , isCircuitBreakerClosed
   , defaultCircuitBreakerOptions
   , circuitBreaker
+  , circuitBreaker'
   , maxBreakerFailures
   , resetTimeoutSecs
   , breakerDescription
+  -- * Work around impredicative types
+  , Middleware(..)
 ) where
 
 import Data.Foldable hiding (or, and)
@@ -78,8 +82,24 @@ circuitBreaker :: (MonadBaseControl IO m, MonadBaseControl IO n)
                => CircuitBreakerOptions       -- ^ Options for specifying the circuit breaker behaviour.
                -> BasicService m a b          -- ^ Service to protect with the circuit breaker.
                -> n (CircuitBreakerState, BasicService m a b)
-circuitBreaker options service = 
-  let getCurrentTime              = liftBase $ round `fmap` getPOSIXTime
+circuitBreaker options service = do
+  (stateRef, f) <- circuitBreaker' options
+  return (stateRef, f ^$ service)
+
+-- | A function between 'BasicService's.
+--
+-- This works around a lack of impredicative types in GHC.
+newtype Middleware = Middleware { (^$) :: forall m a b. MonadBaseControl IO m => BasicService m a b -> BasicService m a b }
+
+-- TODO: Check that values within m aren't lost on a successful call.
+-- | Like 'circuitBreaker' but supports sharing a circuit breaker between services.
+circuitBreaker' :: (MonadBaseControl IO n)
+               => CircuitBreakerOptions       -- ^ Options for specifying the circuit breaker behaviour.
+               -> n (CircuitBreakerState, Middleware)
+circuitBreaker' options = do
+ ref <- newIORef $ BreakerClosed 0
+ return (CircuitBreakerState [ref], Middleware $ \service -> let
+      getCurrentTime              = liftBase $ round `fmap` getPOSIXTime
       failureMax                  = maxBreakerFailures options
       callIfClosed request ref    = bracketOnError (return ()) (\_ -> incErrors ref) (\_ -> service request)
       canaryCall request ref      = do
@@ -105,7 +125,5 @@ circuitBreaker options service =
                                       case status of 
                                         (BreakerClosed _)  -> callIfClosed request ref
                                         (BreakerOpen _)    -> callIfOpen request ref
-                                      
-  in do
-        ref <- newIORef $ BreakerClosed 0
-        return (CircuitBreakerState [ref], breakerService ref)
+      in breakerService ref
+        )
